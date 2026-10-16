@@ -1,0 +1,375 @@
+---
+title: "MonthlyAnalysis"
+format: 
+  html:
+    toc: true
+    code-tools: true 
+    embed-resources: true
+editor: visual
+---
+
+```{r}
+#| message: false
+#| warning: false
+library(tswge)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+```
+
+```{r}
+#| message: false
+#| warning: false
+
+```
+
+### 1) Prepare Data.
+
+I'm changing the dataset to be a monthly data.
+
+```{r}
+#| message: false
+#| warning: false
+#Load original Kaggle Data
+saas <- read_csv("SaaS-Sales.csv")
+
+#Get only relevant columns. Then get total sum of sales made for each day.
+##  Data only has dates for which sales were made
+amazon = saas %>%
+  mutate(
+    orderdate = mdy(`Order Date`),
+    year = year(orderdate),
+    quarter = paste0("Qtr", quarter(orderdate)),
+    month = month(orderdate, label = TRUE, abbr = TRUE)
+  ) %>%
+  group_by(year, quarter, month, orderdate) %>%
+  summarise(
+    sumofsales = sum(Sales, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(orderdate)
+
+```
+
+```{r}
+
+amazon_monthly <- amazon %>%
+  mutate(
+    orderdate = (orderdate),
+    orderdate = make_date(year(orderdate), month(orderdate), 1),
+    month_num = month(orderdate),
+    month_label = paste0(
+      sprintf("%02d", month_num),
+      "-",
+      month(orderdate, label = TRUE, abbr = TRUE)
+    )
+  ) %>%
+  group_by(year, quarter, month, month_num, month_label, orderdate) %>%
+  summarise(
+    monthly_sales = sum(sumofsales, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+
+```
+
+### 2) Visually inspect the data
+
+```{r}
+amazon_monthly <- amazon_monthly[order(amazon_monthly$orderdate), ]
+
+plot(
+  amazon_monthly$orderdate,
+  amazon_monthly$monthly_sales,
+  type = "l",
+  xlab = "Year (and Month)",
+  ylab = "Monthly Sales",
+  main = "Amazon Monthly Sales"
+)
+```
+
+### 3) Convert the amazon_monthly to a time series type file
+
+```{r}
+amazon_ts = ts(amazon_monthly$monthly_sales,start=c(2020,1),end=c(2023,12),frequency = 12)
+
+#plot(amazon_ts)
+ plotts.wge(amazon_ts, main="Amazon Monthly Sales")
+```
+
+### 4) Use plotts to observe autocorrelations and spectral frequency
+
+The realization here looks seasonal, with a period of 12. There appears to be an increasing trend, but it is not clearly obvious from the appearance in the realization. The autocorrelation shows some decay, but there are some prominent spikes in the lag of 0, lag=12 and lag=24. 
+
+The Spectral frequency shows peaks near 0, possibly near 0.08 and 0.33. This corresponds with a period of almost infinity, but also approximately 12 and 3.
+
+```{r}
+# I include periodogram, otherwise 3 charts side by side looks cramped
+sp=plotts.sample.wge(amazon_ts,periodogram=TRUE)
+
+```
+
+Any difference when you log the data. (NO)
+
+I tried to log the dataset, but the changes to see anything is minimal here.
+
+```{r}
+amazon_ts_log = log(amazon_ts)
+
+sp=plotts.sample.wge(amazon_ts_log,periodogram=TRUE)
+```
+
+### 5) Check for white noise using ljung-box test.
+
+Try K=12, to match the period in the data, corresponding to 1 year.
+
+```{r}
+ljung.wge(amazon_ts, K = 12)
+```
+
+Try K=24, to correspond with 2 years (24 months)
+
+```{r}
+# K = 24 checks the first two years of monthly autocorrelations.
+ljung.wge(amazon_ts, K = 24)
+```
+
+The Ljung-Box test rejects the null hypothesis of white noise for the raw monthly sales series at K = 12 and K = 24. This indicates that the raw series contains statistically significant autocorrelation. Since the time plot also showed large sales spikes and possible changes in level, I tested this data against other models, such as ARMA, AR, and line series.
+
+### 6) Identifying p, q values.
+
+```{r}
+aic.wge(amazon_ts,p= 0:10,q= 0:6) #AIC selects p= 6,q= 4
+```
+
+```{r}
+aic.wge(amazon_ts,p= 0:10,q= 0:6,type= 'bic') #BIC selects p= 1,q= 0
+```
+
+### 7) Try to fit ARMA process.
+
+```{r}
+amazon_arma64_fit =  est.arma.wge(amazon_ts, p = 6, q = 4)
+```
+Check Stationary and invertibility?
+
+```{r}
+factor.wge(phi = amazon_arma64_fit$phi)    
+factor.wge(phi = amazon_arma64_fit$theta)  
+```
+Based on the roots, this is not a stationary mode, since all AR roots must like outside root circle. The second table shows roots that may be near the invertibility boundary, based on the first row with the imaginary number.
+
+
+Check against fitted ARMA model.
+
+The realization here looks somewhat seasonal. There appears to be an no trend. The autocorrelation shows some decay, but there are some prominent spikes in the lag of 0, lag=12 and lag=24. 
+
+The Spectral frequency shows peaks near 0.08, possibly near 0.25 and 0.4. This corresponds with a period of 12, 4 and 2.5 (so 3).
+```{r}
+plotts.sample.wge(amazon_arma64_fit$res, lag.max = 24, arlimits = TRUE,periodogram=TRUE)
+```
+
+```{r}
+ljung.wge(amazon_arma64_fit$res, K = 12, p = 6, q = 4)
+```
+
+```{r}
+ljung.wge(amazon_arma64_fit$res, K = 24, p = 6, q = 4)
+```
+
+```{r}
+shapiro.test(amazon_arma64_fit$res)
+```
+
+```{r}
+fore.arma.wge(amazon_ts, phi = amazon_arma64_fit$phi, theta = amazon_arma64_fit$theta,
+ n.ahead = 24, limits = TRUE)
+```
+
+### 7b) Test for AR model
+
+Test for p = 1, q = 0
+
+```{r}
+amazon_ar1_fit =  est.arma.wge(amazon_ts, p = 1, q = 0)
+```
+
+
+Check against fitted AR1  model.
+
+The realization here looks somewhat seasonal (more similar to the original dataset), with a period of 12. There appears to be an increasing trend especially near the end. The autocorrelation shows some decay, but there are some prominent spikes in the lag of 0, lag=12 and lag=24. 
+
+The Spectral frequency shows peaks near 0.08, and 0.33. This corresponds with a period of 12 and 3.
+```{r}
+plotts.sample.wge(amazon_ar1_fit$res,lag.max = 24,arlimits = TRUE,periodogram = TRUE
+)
+```
+
+```{r}
+ljung.wge(amazon_ar1_fit$res, K = 12, p = 1, q = 0)
+```
+
+```{r}
+ljung.wge(amazon_ar1_fit$res, K = 24, p = 1, q = 0)
+```
+
+```{r}
+shapiro.test(amazon_ar1_fit$res)
+```
+
+```{r}
+ fore.arma.wge(amazon_ts,phi = amazon_ar1_fit$phi,theta = amazon_ar1_fit$theta,n.ahead = 12,limits = TRUE)
+```
+
+### 8) SLR line + noise tesing
+
+Check against fitted SLR model.
+
+The realization here looks somewhat seasonal (more similar to the original dataset), There appears to be an increasing trend especially near the end. The autocorrelation shows some decay, but there are some prominent spikes in the lag of 0, lag=12 and lag=24. 
+
+The Spectral frequency shows peaks near 0.08, and 0.33. This corresponds with a period of 12 and 3.
+
+```{r}
+amazon_reg = slr.wge(amazon_ts)
+
+t = 1:length(amazon_ts)
+
+amazon_zhat = amazon_ts - amazon_reg$b0hat - amazon_reg$b1hat * t
+
+plotts.sample.wge(  amazon_zhat, lag.max = 24, arlimits = TRUE,  periodogram = TRUE)
+```
+
+
+```{r}
+aic.wge(amazon_zhat, p = 0:10, q = 0:6) #picks p = 5 and q = 1 
+```
+
+
+```{r}
+aic.wge(amazon_zhat, p = 0:10, q = 0:6, type = "bic") #picks p = 0 and q = 0 
+```
+
+### 8b) Line + ARMA fit testing
+Try line + ARMA fit?
+
+```{r}
+amazon_line_arma51_fit = est.arma.wge(amazon_zhat, p = 5, q = 1)
+
+plotts.sample.wge(amazon_line_arma51_fit$res,lag.max = 24,arlimits = TRUE,periodogram = TRUE)
+
+ljung.wge(amazon_line_arma51_fit$res, K = 12, p = 5, q = 1)
+ljung.wge(amazon_line_arma51_fit$res, K = 24, p = 5, q = 1)
+shapiro.test(amazon_line_arma51_fit$res)
+```
+
+
+
+```{r}
+ljung.wge(amazon_zhat, K = 12, p = 0, q = 0)
+```
+
+```{r}
+#ljung.wge(amazon_zhat, K = 24, p = 0, q = 0)
+```
+
+```{r}
+shapiro.test(amazon_zhat)
+```
+
+
+## Model Comparisons
+```{r}
+model_results = data.frame(
+  model = c("AIC ARMA(6,4)","BIC AR(1)","Line + AIC ARMA(5,1)", "Line + noise"),
+  ljung_k12_p = c(
+    ljung.wge(amazon_arma64_fit$res, K = 12, p = 6, q = 4)$pval,
+    ljung.wge(amazon_ar1_fit$res, K = 12, p = 1, q = 0)$pval,
+    ljung.wge(amazon_line_arma51_fit$res, K = 12, p = 5, q = 1)$pval,
+    ljung.wge(amazon_zhat, K = 12, p = 0, q = 0)$pval
+  ),
+  ljung_k24_p = c(
+    ljung.wge(amazon_arma64_fit$res, K = 24, p = 6, q = 4)$pval,
+    ljung.wge(amazon_ar1_fit$res, K = 24, p = 1, q = 0)$pval,
+    ljung.wge(amazon_line_arma51_fit$res, K = 24, p = 5, q = 1)$pval,
+    ljung.wge(amazon_zhat, K = 24, p = 0, q = 0)$pval
+  ),
+  shapiro_p = c(
+    shapiro.test(amazon_arma64_fit$res)$p.value,
+    shapiro.test(amazon_ar1_fit$res)$p.value,
+    shapiro.test(amazon_line_arma51_fit$res)$p.value,
+    shapiro.test(amazon_zhat)$p.value
+  )
+)
+
+model_results
+```
+
+This forecast is exploratory because none of the candidate models fully passed Ljung-Box diagnostics.
+```{r}
+noise_forecast = fore.arma.wge(amazon_zhat,phi = amazon_line_arma51_fit$phi,
+  theta = amazon_line_arma51_fit$theta,n.ahead = 12,limits = TRUE)
+
+future_t = (length(amazon_ts) + 1):(length(amazon_ts) + 12)
+future_line = amazon_reg$b0hat + amazon_reg$b1hat * future_t
+
+final_forecast = future_line + noise_forecast$f
+
+final_forecast
+```
+
+
+
+
+
+## Explored but inconclusive
+
+### A1) Attempted Smoothing that did not yield much results
+
+```{r}
+amazon_ts_5=ma.smooth.wge(amazon_ts,order= 5, plot= FALSE)
+
+plot(amazon_ts,xlab='Time Stamp',ylab='Amazon monthly sales',main='Amazon Sales for Regular vs 5th order Smooth')
+lines(amazon_ts_5$smooth,col = "red", lty = 5)
+legend("topleft",
+       legend = c("Regular", "5th Order Smooth"),
+       col = c("black", "red"),
+       lty = 1,
+       lwd = c(1, 2))
+```
+
+### A2) Try some decomposition
+
+Additive Decomposition
+
+```{r}
+new_plot = decompose(amazon_ts,type= 'additive')
+
+
+par(mfrow = c(2, 2))
+plot(new_plot$x, main = "Realization", ylab = "")
+plot(new_plot$trend, main = "Trend", ylab = "")
+plot(new_plot$seasonal, main = "Seasonal", ylab = "")
+plot(new_plot$random, main = "Noise", ylab = "")
+
+
+```
+
+Multiplicative Decomposition
+
+```{r}
+new_plot = decompose(amazon_ts,type= 'multiplicative')
+
+
+par(mfrow = c(2, 2))
+plot(new_plot$x, main = "Realization", ylab = "")
+plot(new_plot$trend, main = "Trend", ylab = "")
+plot(new_plot$seasonal, main = "Seasonal", ylab = "")
+plot(new_plot$random, main = "Noise", ylab = "")
+
+
+```
+
+
